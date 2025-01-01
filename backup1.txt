@@ -1,0 +1,185 @@
+const WebSocket = require('ws');
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const app = express();
+const server = require('http').createServer(app);
+const wss = new WebSocket.Server({ server });
+
+// File path to store device names
+const DEVICE_NAMES_FILE = path.join(__dirname, 'device-names.json');
+
+// Store connected ESP32 devices and web clients
+let connectedDevices = new Map();
+let webClients = new Set();
+let deviceNames = new Map();
+
+// Utility function to load saved device names
+const loadDeviceNames = () => {
+    try {
+        if (fs.existsSync(DEVICE_NAMES_FILE)) {
+            const data = fs.readFileSync(DEVICE_NAMES_FILE, 'utf8');
+            deviceNames = new Map(Object.entries(JSON.parse(data)));
+            log('Loaded device names:', deviceNames);
+        }
+    } catch (error) {
+        logError('Error loading device names:', error);
+    }
+};
+
+// Utility function to save device names
+const saveDeviceNames = () => {
+    try {
+        const names = Object.fromEntries(deviceNames);
+        fs.writeFileSync(DEVICE_NAMES_FILE, JSON.stringify(names, null, 2));
+        log('Saved device names:', names);
+    } catch (error) {
+        logError('Error saving device names:', error);
+    }
+};
+
+// Utility function for logging
+const log = (...args) => {
+    console.log(...args);
+};
+
+// Utility function for logging errors
+const logError = (...args) => {
+    console.error(...args);
+};
+
+// Utility function to serialize device data
+const serializeDeviceList = () => {
+    return Array.from(connectedDevices.entries()).map(([id, device]) => ({
+        id, 
+        name: device.name, 
+        lightStatus: device.lightStatus
+    }));
+};
+
+// Broadcast device list to all web clients
+const broadcastDeviceList = () => {
+    const deviceList = serializeDeviceList();
+    log('Broadcasting device list:', deviceList);
+    broadcastToWeb({
+        type: 'deviceList',
+        devices: deviceList
+    });
+};
+
+// Broadcast a message to all web clients
+const broadcastToWeb = (message) => {
+    const messageStr = JSON.stringify(message);
+    webClients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(messageStr);
+        }
+    });
+};
+
+// Send device list to a specific WebSocket
+const sendDeviceList = (ws) => {
+    const deviceList = serializeDeviceList();
+    ws.send(JSON.stringify({
+        type: 'deviceList',
+        devices: deviceList
+    }));
+};
+
+// Load saved device names at startup
+loadDeviceNames();
+
+// WebSocket connection handling
+wss.on('connection', (ws) => {
+    log('New connection received');
+    let deviceId = null;
+    let isWebClient = false;
+
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+
+            switch (data.type) {
+                case 'register':
+                    deviceId = data.deviceId;
+                    const savedName = deviceNames.get(deviceId) || `ESP32-${deviceId}`;
+                    connectedDevices.set(deviceId, { name: savedName, lightStatus: false, ws });
+                    log(`ESP32 device connected - ID: ${deviceId}, Name: ${savedName}`);
+
+                    broadcastToWeb({
+                        type: 'notification',
+                        message: `Device "${savedName}" connected`
+                    });
+                    broadcastDeviceList();
+                    break;
+
+                case 'webClient':
+                    isWebClient = true;
+                    webClients.add(ws);
+                    log('Web client connected');
+                    sendDeviceList(ws);
+                    break;
+
+                case 'updateName':
+                    if (connectedDevices.has(data.deviceId)) {
+                        const device = connectedDevices.get(data.deviceId);
+                        const oldName = device.name;
+                        device.name = data.name;
+
+                        deviceNames.set(data.deviceId, data.name);
+                        saveDeviceNames();
+
+                        log(`Device ${data.deviceId} renamed from "${oldName}" to "${data.name}"`);
+
+                        broadcastToWeb({
+                            type: 'notification',
+                            message: `Device "${oldName}" renamed to "${data.name}"`
+                        });
+                        broadcastDeviceList();
+                    }
+                    break;
+
+                case 'toggleLight':
+                    if (connectedDevices.has(data.deviceId)) {
+                        const device = connectedDevices.get(data.deviceId);
+                        device.lightStatus = data.status;
+                        device.ws.send(JSON.stringify({ type: 'lightCommand', status: data.status }));
+
+                        broadcastToWeb({
+                            type: 'notification',
+                            message: `Light ${data.status ? 'turned ON' : 'turned OFF'} for device "${device.name}"`
+                        });
+                        broadcastDeviceList();
+                    }
+                    break;
+
+                default:
+                    logError('Unknown message type:', data.type);
+            }
+        } catch (error) {
+            logError('Error processing message:', error);
+        }
+    });
+
+    ws.on('close', () => {
+        if (isWebClient) {
+            webClients.delete(ws);
+            log('Web client disconnected');
+        } else if (deviceId && connectedDevices.has(deviceId)) {
+            const deviceName = connectedDevices.get(deviceId).name;
+            connectedDevices.delete(deviceId);
+            log(`ESP32 device disconnected - ID: ${deviceId}, Name: ${deviceName}`);
+
+            broadcastToWeb({
+                type: 'notification',
+                message: `Device "${deviceName}" disconnected`
+            });
+            broadcastDeviceList();
+        }
+    });
+});
+
+app.use(express.static('public'));
+server.listen(3000, () => {
+    log('Server running on port 3000');
+});
